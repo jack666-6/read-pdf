@@ -3,26 +3,16 @@
 =============================
 接受上傳的 PDF 或 Google Drive 直連網址，
 抽取「資金運用計畫」與「具體發債目的」並以 JSON 回傳。
-
-部署於 Zeabur：
-  - 監聽 PORT 環境變數（Zeabur 自動注入）
-  - 支援 multipart/form-data 上傳 PDF
 """
 
 import os
 import re
-import io
 import tempfile
 import httpx
 import pdfplumber
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
-
-# ──────────────────────────────────────────────────────────────
-# 抽取邏輯（與 extract_prospectus.py 相同核心）
-# ──────────────────────────────────────────────────────────────
 
 TARGET_SECTIONS = [
     {
@@ -66,12 +56,13 @@ SEE_PAGE_RE = re.compile(
 )
 
 
-def extract_all_pages(pdf_bytes: bytes) -> list[dict]:
+def extract_all_pages(pdf_path: str) -> list[dict]:
     result = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
             result.append({"page": i, "text": text, "lines": text.splitlines()})
+            page.flush_cache()
     return result
 
 
@@ -136,8 +127,8 @@ def check_see_page_redirect(line: str):
     return int(m.group(1)) if m else None
 
 
-def run_extraction(pdf_bytes: bytes) -> dict:
-    pages = extract_all_pages(pdf_bytes)
+def run_extraction(pdf_path: str) -> dict:
+    pages = extract_all_pages(pdf_path)
     offset = estimate_page_offset(pages)
     results = {"total_pages": len(pages), "page_offset": offset, "sections": {}}
 
@@ -158,7 +149,6 @@ def run_extraction(pdf_bytes: bytes) -> dict:
         found_page = pages[pg_idx]
         found_line_text = found_page["lines"][li_idx]
 
-        # 偵測跳頁指示
         redirect_doc_page = None
         for scan_li in range(li_idx, min(li_idx + 6, len(found_page["lines"]))):
             redirect_doc_page = check_see_page_redirect(found_page["lines"][scan_li])
@@ -193,77 +183,81 @@ def run_extraction(pdf_bytes: bytes) -> dict:
     return results
 
 
-# ──────────────────────────────────────────────────────────────
-# FastAPI 應用程式
-# ──────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="公開說明書抽取 API",
-    description="上傳 PDF 或提供 Google Drive 直連連結，自動抽取資金運用計畫與具體發債目的",
-    version="1.0.0",
+    description="上傳 PDF，自動抽取資金運用計畫與具體發債目的",
+    version="1.1.0",
 )
 
 
 @app.get("/health")
 def health_check():
-    """N8N 可用此端點確認服務是否存活。"""
     return {"status": "ok"}
 
 
 @app.post("/extract/upload")
 async def extract_from_upload(file: UploadFile = File(...)):
-    """
-    上傳 PDF 檔案後抽取。
-    N8N 使用「HTTP Request」節點，Body 選 Form Data，欄位名稱為 file。
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="只接受 PDF 檔案")
 
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) == 0:
-        raise HTTPException(status_code=400, detail="檔案為空")
-
+    tmp_path = None
     try:
-        result = run_extraction(pdf_bytes)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
+            total = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                total += len(chunk)
+
+        if total == 0:
+            raise HTTPException(status_code=400, detail="檔案為空")
+
+        result = run_extraction(tmp_path)
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"抽取失敗：{str(e)}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
     return JSONResponse(content={"filename": file.filename, **result})
 
 
 @app.post("/extract/from-url")
-async def extract_from_url(url: str = Query(..., description="PDF 的直連網址（Google Drive export 格式）")):
-    """
-    從 URL 下載 PDF 後抽取。
-    Google Drive 直連格式：
-      https://drive.google.com/uc?export=download&id=<FILE_ID>
-
-    N8N 使用「HTTP Request」節點，Method: POST，
-    Query Parameter: url=<google_drive_export_url>
-    """
+async def extract_from_url(url: str = Query(...)):
+    tmp_path = None
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"無法下載 PDF：{str(e)}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp_path = tmp.name
+            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                        tmp.write(chunk)
 
-    content_type = response.headers.get("content-type", "")
-    if "pdf" not in content_type and not url.lower().endswith(".pdf") and "export" not in url:
-        raise HTTPException(status_code=400, detail=f"回應內容不像 PDF（Content-Type: {content_type}）")
+        result = run_extraction(tmp_path)
 
-    pdf_bytes = response.content
-    try:
-        result = run_extraction(pdf_bytes)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"抽取失敗：{str(e)}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
     return JSONResponse(content={"source_url": url, **result})
 
-
-# ──────────────────────────────────────────────────────────────
-# 啟動（Zeabur 使用 PORT 環境變數）
-# ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
