@@ -1,7 +1,9 @@
 """
 公開說明書抽取 API (FastAPI)
 """
-
+def parse_summary(content):
+    print(content[:1000])  # 加這行
+    summary = {"發行資金總額": None, "發行用途": []}
 import os
 import re
 import tempfile
