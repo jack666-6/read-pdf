@@ -15,7 +15,7 @@ TARGET_SECTIONS = [
     {
         "label": "資金運用計畫之用途及預計可能產生效益之概要",
         "keywords": ["資金運用計畫之用途","資金運用計畫","預計可能產生效益","資金用途及預計"],
-        "detail_keywords": ["計畫項目及運用進度","本計畫所需資金","資金來源","預計可能產生之效益"],
+        "detail_keywords": ["計畫項目及運用進度","計畫項目及預計進度","本計畫所需資金","資金來源","預計可能產生之效益"],
     },
 ]
 
@@ -91,13 +91,11 @@ def check_see_page_redirect(line):
 def parse_summary(content):
     summary = {"發行資金總額": None, "發行用途": []}
 
-    # 抓總額
     total_match = re.search(r"本計畫所需資金總額[：:]\s*新台幣\s*([\d,，]+)\s*仟元", content)
     if total_match:
         summary["發行資金總額"] = f"新台幣 {total_match.group(1).replace('，', ',')} 仟元"
 
-    # 抓計畫項目區塊
-    plan_match = re.search(r"計畫項目及運用進度.*?\n(.*?)合計", content, re.DOTALL)
+    plan_match = re.search(r"計畫項目及(?:運用進度|預計進度).*?\n(.*?)合計", content, re.DOTALL)
     if plan_match:
         block = plan_match.group(1)
         lines = block.splitlines()
@@ -105,14 +103,12 @@ def parse_summary(content):
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            # 純中文行（項目名稱）接下一行有金額
             if re.match(r"^[\u4e00-\u9fff\-－()（）\s]{2,20}$", line) and len(line) >= 2:
                 if not any(w in line for w in skip_words):
                     if i + 1 < len(lines):
                         amt = re.search(r"([\d,]{4,})", lines[i + 1])
                         if amt:
                             summary["發行用途"].append(f"{line}：{amt.group(1).replace(',','')} 仟元")
-            # 中文+金額同一行
             elif re.search(r"[\u4e00-\u9fff]{2,}", line):
                 m = re.search(r"([\u4e00-\u9fff\s]{2,15})\s+\d{3,}.*?\s+([\d,]{4,})\s+[\d,]+", line)
                 if m and not any(w in m.group(1) for w in skip_words):
@@ -152,7 +148,7 @@ def run_extraction(pdf_path):
     return parse_summary(content)
 
 
-app = FastAPI(title="公開說明書抽取 API", version="2.0.0")
+app = FastAPI(title="公開說明書抽取 API", version="2.1.0")
 
 @app.get("/health")
 def health_check():
